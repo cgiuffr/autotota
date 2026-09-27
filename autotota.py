@@ -7,6 +7,7 @@ year,title,doi,url,citations_total,citations_5y,normalized_total_citations,norma
 """
 
 import csv
+import html
 import math
 import re
 import time
@@ -14,6 +15,7 @@ import statistics
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
+from urllib.parse import urljoin
 
 # ----------------- Config -----------------
 DBLP_INDEX = "https://dblp.org/db/conf/<venue>/index"
@@ -25,7 +27,7 @@ YEAR_MIN = None  # e.g., 2010
 YEAR_MAX = None  # e.g., 2025
 
 # Politeness / retry
-DBLP_DELAY_SEC = 0.2
+DBLP_DELAY_SEC = 1.0
 OPENALEX_DELAY_SEC = 0.1
 MAX_RETRIES = 4
 TIMEOUT = 45
@@ -37,9 +39,42 @@ CUTOFF_DATE = f"{FIVE_YEAR_CUTOFF+1}-01-01"        # start of the next year -> s
 
 # ----------------- Helpers -----------------
 
-def get_soup(url, timeout=TIMEOUT):
-    r = requests.get(url, timeout=timeout, headers=USER_AGENT)
+DBLP_SESSION = requests.Session()
+DBLP_SESSION.headers.update(USER_AGENT)
+ANUBIS_REFRESH_RX = re.compile(r'(\d+);\s*url=([^"\s]*anubis/api/pass-challenge[^"\s]*)', re.I)
+
+def dblp_get(url, timeout=TIMEOUT):
+    # DBLP rate-limits with 429 + Retry-After, or by dropping connections; back off and retry.
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            r = DBLP_SESSION.get(url, timeout=timeout)
+        except requests.ConnectionError:
+            if attempt == MAX_RETRIES:
+                raise
+            wait = 60 * (attempt + 1)
+            print(f"DBLP dropped the connection, waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        if r.status_code != 429 or attempt == MAX_RETRIES:
+            break
+        retry_after = r.headers.get("Retry-After", "")
+        wait = int(retry_after) if retry_after.isdigit() else 30 * (attempt + 1)
+        print(f"DBLP rate limit hit, waiting {wait}s...")
+        time.sleep(wait)
     r.raise_for_status()
+    return r
+
+def get_soup(url, timeout=TIMEOUT):
+    r = dblp_get(url, timeout)
+    # DBLP sits behind an Anubis bot check; its meta-refresh challenge is passed by
+    # following the refresh link (sent as a Refresh header or a <meta> tag), which
+    # sets a cookie reused by the session.
+    m = ANUBIS_REFRESH_RX.search(r.headers.get("Refresh", "")) or ANUBIS_REFRESH_RX.search(r.text)
+    if m:
+        time.sleep(int(m.group(1)))
+        r = dblp_get(urljoin(url, html.unescape(m.group(2))), timeout)
+    if "anubis_challenge" in r.text:
+        raise RuntimeError(f"Could not pass DBLP bot check for {url}")
     return BeautifulSoup(r.text, "html.parser")
 
 def extract_proceedings_links_and_years(index_url):
